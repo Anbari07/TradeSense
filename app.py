@@ -13,7 +13,7 @@ STARTING_BALANCE = 5_000.00
 
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes and origins
+CORS(app)  # Allow all origins; can be restricted to your React origin if needed.
 
 
 def get_db_connection():
@@ -23,60 +23,87 @@ def get_db_connection():
 
 
 def init_db():
-    """Initialize SQLite database with trades and user_balance tables."""
+    """Initialize SQLite database for TradeSense."""
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Users table: a single demo user with balance, equity, and status.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            balance REAL NOT NULL,
+            equity REAL NOT NULL,
+            status TEXT NOT NULL
+        );
+        """
+    )
+
+    # Trades table: record each simulated trade.
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            action TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            type TEXT NOT NULL,
             price REAL NOT NULL,
-            quantity REAL NOT NULL,
-            amount REAL NOT NULL
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         );
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_balance (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            balance REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'RUNNING'
-        );
-        """
-    )
-
-    # In case the DB already exists without the status column, add it safely.
-    cur.execute("PRAGMA table_info(user_balance);")
-    columns = [row[1] for row in cur.fetchall()]
-    if "status" not in columns:
-        cur.execute(
-            "ALTER TABLE user_balance ADD COLUMN status TEXT NOT NULL DEFAULT 'RUNNING';"
-        )
-
-    # Ensure we have a single user row with starting balance
-    cur.execute("SELECT balance, status FROM user_balance WHERE id = 1;")
+    # Ensure default user exists (id=1)
+    cur.execute("SELECT id FROM users WHERE id = 1;")
     row = cur.fetchone()
     if row is None:
         cur.execute(
-            "INSERT INTO user_balance (id, balance, status) VALUES (1, ?, 'RUNNING');",
-            (STARTING_BALANCE,),
+            "INSERT INTO users (id, balance, equity, status) VALUES (?, ?, ?, ?);",
+            (1, STARTING_BALANCE, STARTING_BALANCE, "RUNNING"),
         )
 
     conn.commit()
     conn.close()
 
 
-def get_btc_usd_price():
+def get_default_user(conn: sqlite3.Connection) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute("SELECT id, balance, equity, status FROM users WHERE id = 1;")
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("Default user not initialized")
+    return row
+
+
+def update_user_state(
+    conn: sqlite3.Connection, balance: float, equity: float, status: str
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET balance = ?, equity = ?, status = ? WHERE id = 1;",
+        (balance, equity, status),
+    )
+
+
+def compute_status_from_equity(equity: float) -> str:
     """
-    Get real-time-ish BTC-USD price using yfinance.
-    Uses recent 1-minute interval data for robustness.
+    Compute prop-firm style status from equity.
+
+    Rules (starting at 5000):
+      - equity < 4750 -> FAILED (5% loss)
+      - equity > 5500 -> PASSED (10% profit)
+      - otherwise     -> RUNNING
     """
+    if equity < 4750:
+        return "FAILED"
+    if equity > 5500:
+        return "PASSED"
+    return "RUNNING"
+
+
+def get_btc_usd_price() -> float:
+    """Get real BTC-USD price via yfinance."""
     ticker = yf.Ticker("BTC-USD")
     hist = ticker.history(period="1d", interval="1m")
     if hist.empty:
@@ -85,200 +112,162 @@ def get_btc_usd_price():
     return round(price, 2)
 
 
-def get_mock_iam_price():
+def get_iam_ma_price() -> float:
     """
-    MOCK price generator for Morocco Telecom (IAM).
-    Base price: 100.00 MAD
-    Random fluctuation between -0.5 and +0.5 on EACH API call.
-    No scraping or external data sources.
+    Generate a realistic mock price for IAM.MA (Maroc Telecom).
+    Around 100.00 MAD, between 99.50 and 100.50 per call.
+    No scraping, just randomness.
     """
-    base_price = 100.00
-    fluctuation = random.uniform(-0.5, 0.5)
-    price = base_price + fluctuation
-    return round(price, 4)
+    return round(random.uniform(99.50, 100.50), 4)
 
 
-@app.route("/api/market-data", methods=["GET"])
+@app.route("/api/data", methods=["GET"])
 def market_data():
     """
     Return market data for BTC-USD (real via yfinance)
-    and Morocco Telecom (IAM) (mocked).
+    and IAM.MA (mocked), plus current user state.
     """
-    try:
-        btc_price = get_btc_usd_price()
-    except Exception as e:
-        # In case yfinance fails, return an error message for BTC price
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": f"Failed to fetch BTC-USD price: {e}",
-                }
-            ),
-            500,
-        )
-
-    iam_price = get_mock_iam_price()
-
-    return jsonify(
-        {
-            "success": True,
-            "data": {
-                "btc_usd": {
-                    "ticker": "BTC-USD",
-                    "name": "Bitcoin / US Dollar",
-                    "price": btc_price,
-                    "currency": "USD",
-                },
-                "iam_mad": {
-                    "ticker": "IAM",
-                    "name": "Morocco Telecom (IAM)",
-                    "price": iam_price,
-                    "currency": "MAD",
-                    "note": "MOCK price: base 100.00 MAD +/- 0.5 per call",
-                },
-            },
-        }
-    )
-
-
-def get_current_balance(conn: sqlite3.Connection) -> float:
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM user_balance WHERE id = 1;")
-    row = cur.fetchone()
-    if row is None:
-        raise RuntimeError("User balance not initialized")
-    return float(row["balance"])
-
-
-def get_current_status(conn: sqlite3.Connection) -> str:
-    cur = conn.cursor()
-    cur.execute("SELECT status FROM user_balance WHERE id = 1;")
-    row = cur.fetchone()
-    if row is None:
-        raise RuntimeError("User balance not initialized")
-    return str(row["status"])
-
-
-@app.route("/api/submit-trade", methods=["POST"])
-def submit_trade():
-    """
-    Simulate a trade.
-    Expects JSON: { "ticker": str, "action": "buy" | "sell", "price": number, "quantity": number (optional, default 1) }
-    Saves the trade and updates the user's balance in SQLite.
-    """
-    payload = request.get_json(silent=True) or {}
-
-    ticker = str(payload.get("ticker", "")).strip().upper()
-    action = str(payload.get("action", "")).strip().lower()
-    price = payload.get("price")
-    quantity = payload.get("quantity", 1)
-
-    if not ticker:
-        return jsonify({"success": False, "error": "ticker is required"}), 400
-    if action not in {"buy", "sell"}:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": "action must be 'buy' or 'sell'",
-                }
-            ),
-            400,
-        )
-
-    try:
-        price = float(price)
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "error": "price must be a number"}), 400
-
-    try:
-        quantity = float(quantity)
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "error": "quantity must be a number"}), 400
-
-    if price <= 0:
-        return jsonify({"success": False, "error": "price must be positive"}), 400
-    if quantity <= 0:
-        return jsonify({"success": False, "error": "quantity must be positive"}), 400
-
-    amount = price * quantity
-    if action == "buy":
-        balance_delta = -amount
-    else:  # sell
-        balance_delta = amount
-
     conn = get_db_connection()
     try:
-        cur = conn.cursor()
+        user = get_default_user(conn)
 
-        current_balance = get_current_balance(conn)
-        new_balance = current_balance + balance_delta
-
-        # Optional: enforce no negative balance
-        if new_balance < 0:
+        try:
+            btc_price = get_btc_usd_price()
+        except Exception as e:
+            # If yfinance fails, still return IAM.MA and user data.
             return (
                 jsonify(
                     {
                         "success": False,
-                        "error": "Insufficient balance for this trade",
-                        "balance": current_balance,
-                        "status": get_current_status(conn),
+                        "error": f"Failed to fetch BTC-USD price: {e}",
                     }
                 ),
-                400,
+                500,
             )
+
+        iam_price = get_iam_ma_price()
+
+        return jsonify(
+            {
+                "success": True,
+                "data": {
+                    "btc_usd": {
+                        "symbol": "BTC-USD",
+                        "name": "Bitcoin / US Dollar",
+                        "price": btc_price,
+                        "currency": "USD",
+                    },
+                    "iam_ma": {
+                        "symbol": "IAM.MA",
+                        "name": "Maroc Telecom (IAM)",
+                        "price": iam_price,
+                        "currency": "MAD",
+                        "note": "MOCK price between 99.50 and 100.50 MAD per call",
+                    },
+                },
+                "user": {
+                    "balance": float(user["balance"]),
+                    "equity": float(user["equity"]),
+                    "status": user["status"],
+                },
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.route("/api/trade", methods=["POST"])
+def submit_trade():
+    """
+    Simulate a trade.
+
+    Expects JSON: { "action": "BUY" | "SELL", "symbol": str }
+    - BUY  -> +150$ on balance
+    - SELL -> -200$ on balance (simulated loss)
+
+    Applies prop-firm rules on equity:
+      - equity < 4750 -> FAILED
+      - equity > 5500 -> PASSED
+    """
+    payload = request.get_json(silent=True) or {}
+
+    action = str(payload.get("action", "")).strip().upper()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+
+    if action not in {"BUY", "SELL"}:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "action must be 'BUY' or 'SELL'",
+                }
+            ),
+            400,
+        )
+    if not symbol:
+        return jsonify({"success": False, "error": "symbol is required"}), 400
+
+    conn = get_db_connection()
+    try:
+        user = get_default_user(conn)
+
+        # If user already FAILED or PASSED, you can choose to block further trades.
+        if user["status"] in {"FAILED", "PASSED"}:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "Account is no longer active",
+                    "balance": float(user["balance"]),
+                    "equity": float(user["equity"]),
+                    "status": user["status"],
+                }
+            )
+
+        # Apply simple PnL simulation.
+        if action == "BUY":
+            delta = 150.0
+        else:  # SELL
+            delta = -200.0
+
+        new_balance = float(user["balance"]) + delta
+        # In this simple model, equity == balance (no open positions).
+        new_equity = new_balance
+        new_status = compute_status_from_equity(new_equity)
+
+        # Determine a reference price to store with the trade.
+        price = 0.0
+        if symbol == "BTC-USD":
+            try:
+                price = get_btc_usd_price()
+            except Exception:
+                price = 0.0
+        elif symbol == "IAM.MA":
+            price = get_iam_ma_price()
 
         now_str = datetime.utcnow().isoformat() + "Z"
 
+        cur = conn.cursor()
+
+        # Insert trade record
         cur.execute(
             """
-            INSERT INTO trades (created_at, ticker, action, price, quantity, amount)
-            VALUES (?, ?, ?, ?, ?, ?);
+            INSERT INTO trades (user_id, symbol, type, price, timestamp)
+            VALUES (?, ?, ?, ?, ?);
             """,
-            (now_str, ticker, action, price, quantity, amount),
+            (1, symbol, action, price, now_str),
         )
 
-        cur.execute(
-            "UPDATE user_balance SET balance = ? WHERE id = 1;",
-            (new_balance,),
-        )
-
-        # Risk / evaluation logic based on current equity (here: balance)
-        # Rules:
-        # - Starting balance: 5000
-        # - If equity < 4750 (5% daily loss): FAILED
-        # - If equity < 4500 (10% max loss): FAILED
-        # - If equity > 5500 (10% profit): PASSED
-        status = "RUNNING"
-        if new_balance < 4500:
-            status = "FAILED"
-        elif new_balance < 4750:
-            status = "FAILED"
-        elif new_balance > 5500:
-            status = "PASSED"
-
-        if status != "RUNNING":
-            cur.execute(
-                "UPDATE user_balance SET status = ? WHERE id = 1;",
-                (status,),
-            )
+        # Update user state
+        update_user_state(conn, new_balance, new_equity, new_status)
 
         conn.commit()
 
         return jsonify(
             {
                 "success": True,
-                "trade": {
-                    "ticker": ticker,
-                    "action": action,
-                    "price": price,
-                    "quantity": quantity,
-                    "amount": amount,
-                    "created_at": now_str,
-                },
                 "balance": new_balance,
-                "status": status,
+                "equity": new_equity,
+                "status": new_status,
             }
         )
     except Exception as e:
@@ -296,20 +285,42 @@ def submit_trade():
         conn.close()
 
 
-@app.route("/api/balance", methods=["GET"])
-def get_balance():
-    """Simple helper route to check the current simulated user balance and status."""
+@app.route("/api/reset", methods=["POST"])
+def reset_account():
+    """
+    Reset the demo account to the initial state.
+    - balance = 5000
+    - equity  = 5000
+    - status  = RUNNING
+    - clears all trades
+    """
     conn = get_db_connection()
     try:
-        balance = get_current_balance(conn)
-        status = get_current_status(conn)
-        return jsonify({"success": True, "balance": balance, "status": status})
+        cur = conn.cursor()
+
+        # Reset user state
+        update_user_state(conn, STARTING_BALANCE, STARTING_BALANCE, "RUNNING")
+
+        # Clear trades for this demo user
+        cur.execute("DELETE FROM trades WHERE user_id = 1;")
+
+        conn.commit()
+
+        return jsonify(
+            {
+                "success": True,
+                "balance": STARTING_BALANCE,
+                "equity": STARTING_BALANCE,
+                "status": "RUNNING",
+            }
+        )
     except Exception as e:
+        conn.rollback()
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": f"Failed to fetch balance: {e}",
+                    "error": f"Failed to reset account: {e}",
                 }
             ),
             500,
@@ -319,7 +330,7 @@ def get_balance():
 
 
 if __name__ == "__main__":
-    # Make sure DB exists and is initialized before the server starts
+    # Ensure database is ready before starting the server.
     init_db()
 
     port = int(os.environ.get("PORT", 5000))
